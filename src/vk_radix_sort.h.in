@@ -19,6 +19,12 @@ struct VrdxSorterCreateInfo {
   VkPhysicalDevice physicalDevice;
   VkDevice device;
   VkPipelineCache pipelineCache;
+  /**
+   * Number of significant (low) key bits, 0 = all 32. Keys must be < 2^keyBits.
+   * Each radix pass sorts 8 bits; the pass count is rounded up to an even number
+   * so the result always ends up in the keys / values buffers (keyBits <= 16 -> 2 passes).
+   */
+  uint32_t keyBits;
 };
 
 void vrdxCreateSorter(const VrdxSorterCreateInfo* pCreateInfo, VrdxSorter* pSorter);
@@ -132,6 +138,7 @@ struct VrdxSorter_T {
   VkPipeline downsweepPipeline = VK_NULL_HANDLE;
   VkPipeline downsweepKeyValuePipeline = VK_NULL_HANDLE;
   VkDeviceSize minStorageBufferOffsetAlignment = 16;
+  uint32_t passCount = 4;
 };
 
 struct PushConstants {
@@ -273,6 +280,10 @@ void vrdxCreateSorter(const VrdxSorterCreateInfo* pCreateInfo, VrdxSorter* pSort
   (*pSorter)->downsweepPipeline = downsweepPipeline;
   (*pSorter)->downsweepKeyValuePipeline = downsweepKeyValuePipeline;
   (*pSorter)->minStorageBufferOffsetAlignment = property.limits.minStorageBufferOffsetAlignment;
+
+  uint32_t keyBits = pCreateInfo->keyBits == 0 || pCreateInfo->keyBits > 32 ? 32 : pCreateInfo->keyBits;
+  uint32_t passCount = (keyBits + 7) / 8;
+  (*pSorter)->passCount = (passCount + 1) / 2 * 2;
 }
 
 void vrdxDestroySorter(VrdxSorter sorter) {
@@ -403,7 +414,8 @@ static void gpuSort(VkCommandBuffer commandBuffer, VrdxSorter sorter, uint32_t e
   }
 
   PushConstants pushConstants;
-  for (int i = 0; i < 4; ++i) {
+  const int passCount = static_cast<int>(sorter->passCount);
+  for (int i = 0; i < passCount; ++i) {
     pushConstants.pass = i;
 
     int writeCount = 5;
@@ -497,7 +509,7 @@ static void gpuSort(VkCommandBuffer commandBuffer, VrdxSorter sorter, uint32_t e
                           query + 2 + 3 * i + 2);
     }
 
-    if (i < 3) {
+    if (i < passCount - 1) {
       memoryBarrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
       memoryBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
       memoryBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
