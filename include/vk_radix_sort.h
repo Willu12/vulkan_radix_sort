@@ -21,8 +21,10 @@ struct VrdxSorterCreateInfo {
   VkPipelineCache pipelineCache;
   /**
    * Number of significant (low) key bits, 0 = all 32. Keys must be < 2^keyBits.
-   * Each radix pass sorts 8 bits; the pass count is rounded up to an even number
-   * so the result always ends up in the keys / values buffers (keyBits <= 16 -> 2 passes).
+   * Each radix pass sorts 8 bits (keyBits <= 16 -> 2 passes, <= 24 -> 3 passes). With an odd
+   * pass count the result lands in the storage buffer and is copied back to the keys / values
+   * buffers at the end (they then also need TRANSFER_DST usage). Indirect sorts round the pass
+   * count up to an even number instead, since only the maximum element count is known.
    */
   uint32_t keyBits;
 };
@@ -2593,8 +2595,7 @@ void vrdxCreateSorter(const VrdxSorterCreateInfo* pCreateInfo, VrdxSorter* pSort
   (*pSorter)->minStorageBufferOffsetAlignment = property.limits.minStorageBufferOffsetAlignment;
 
   uint32_t keyBits = pCreateInfo->keyBits == 0 || pCreateInfo->keyBits > 32 ? 32 : pCreateInfo->keyBits;
-  uint32_t passCount = (keyBits + 7) / 8;
-  (*pSorter)->passCount = (passCount + 1) / 2 * 2;
+  (*pSorter)->passCount = (keyBits + 7) / 8;
 }
 
 void vrdxDestroySorter(VrdxSorter sorter) {
@@ -2620,7 +2621,8 @@ void vrdxGetSorterStorageRequirements(VrdxSorter sorter, uint32_t maxElementCoun
   VkDeviceSize storageSize = inoutOffset + inoutSize;
 
   requirements->size = storageSize;
-  requirements->usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+  requirements->usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                        VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 }
 
 void vrdxGetSorterKeyValueStorageRequirements(VrdxSorter sorter, uint32_t maxElementCount,
@@ -2636,7 +2638,8 @@ void vrdxGetSorterKeyValueStorageRequirements(VrdxSorter sorter, uint32_t maxEle
   VkDeviceSize storageSize = inoutOffset + Align(inoutSize, align) + inoutSize;
 
   requirements->size = storageSize;
-  requirements->usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+  requirements->usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                        VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 }
 
 void vrdxCmdSort(VkCommandBuffer commandBuffer, VrdxSorter sorter, uint32_t elementCount,
@@ -2725,7 +2728,10 @@ static void gpuSort(VkCommandBuffer commandBuffer, VrdxSorter sorter, uint32_t e
   }
 
   PushConstants pushConstants;
-  const int passCount = static_cast<int>(sorter->passCount);
+  // Indirect sorts only know the maximum element count, so the final copy of an odd pass count
+  // could overwrite keys / values past the actual count; use an even pass count for them.
+  const int passCount = static_cast<int>(indirectBuffer ? (sorter->passCount + 1) / 2 * 2
+                                                        : sorter->passCount);
   for (int i = 0; i < passCount; ++i) {
     pushConstants.pass = i;
 
@@ -2828,6 +2834,33 @@ static void gpuSort(VkCommandBuffer commandBuffer, VrdxSorter sorter, uint32_t e
                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &memoryBarrier, 0, NULL, 0,
                            NULL);
     }
+  }
+
+  // Odd pass count: the last pass wrote to the storage buffer, copy the result back.
+  if (passCount % 2 == 1) {
+    memoryBarrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    memoryBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    memoryBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &memoryBarrier, 0, NULL, 0, NULL);
+
+    VkBufferCopy region;
+    region.srcOffset = inoutOffset;
+    region.dstOffset = keysOffset;
+    region.size = elementCount * sizeof(uint32_t);
+    vkCmdCopyBuffer(commandBuffer, storageBuffer, keysBuffer, 1, &region);
+    if (valuesBuffer) {
+      region.srcOffset = inoutOffset + Align(inoutSize, align);
+      region.dstOffset = valuesOffset;
+      vkCmdCopyBuffer(commandBuffer, storageBuffer, valuesBuffer, 1, &region);
+    }
+
+    memoryBarrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    memoryBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    memoryBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &memoryBarrier, 0, NULL, 0,
+                         NULL);
   }
 
   if (queryPool) {
